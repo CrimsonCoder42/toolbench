@@ -1,0 +1,16 @@
+_delete/
+_reference/
+.claude/
+.env
+.env.*
+!.env.example
+*.test
+*.out
+/bin/
+.DS_Store
+*.swp
+compare/vendor/
+**/node_modules/
+
+# raw test and benchmark output in work folders
+doc/**/out/

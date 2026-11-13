@@ -1,0 +1,1214 @@
+=== package guard
+package guard // import "github.com/CrimsonCoder42/toolbench/guard"
+
+Package guard keeps shared mutable state behind a stated guard
+(.claude/rules/go-concurrency.md, rule 8), in the two shapes Effective Go names:
+a value behind its own mutex (Guarded), and a goroutine that owns its state and
+serves requests sent on a channel (Confine, "share memory by communicating").
+
+ID short form: GUARD (IDs are TB-GUARD-NNN).
+
+Exports:
+
+    TB-GUARD-001  Guarded  a value of type T behind its own mutex: Do runs fn on it under the lock, Load copies it
+    TB-GUARD-002  Confine  serves requests on one goroutine that owns the state, until reqs closes or ctx is done
+
+FUNCTIONS
+
+func Confine[S any](ctx context.Context, state S, reqs <-chan func(*S)) (S, error)
+    Confine makes the calling goroutine the only owner of state: it receives
+    requests from reqs and runs each one, in arrival order, with a pointer to
+    its copy of state, until reqs is closed, ctx is done or a request panics,
+    and then returns the final state. A request that needs an answer closes over
+    its own reply channel. A nil reqs is handled as a closed one; a nil request
+    is skipped; a nil ctx is context.Background(). Run it as go func() { s,
+    err = guard.Confine(ctx, s0, reqs) }() for a separate owner goroutine;
+    that goroutine ends when Confine returns.
+
+    The *S a request receives is valid only while it runs (keeping it is a data
+    race). The returned S is a shallow copy of the final state.
+
+    ID: TB-GUARD-002 Pattern: confinement (one goroutine owns the state;
+    others send it requests) Authority: Effective Go, go.dev, "Concurrency",
+    "Share by communicating" Authority: Cox-Buday, Concurrency in Go, O'Reilly,
+    2017, ch.4, "Confinement" Goroutines: none; the loop runs on the caller's
+    goroutine and has returned when Confine returns Cancel: ctx done: returns
+    at once when waiting, or after the request it has received finishes Cancel:
+    a request already received runs to completion; no request is received
+    after that Errors: nil when reqs is closed (every request sent ran) or nil;
+    context.Cause(ctx) when ctx is done Errors: a panic in a request stops the
+    loop: the state as the panic left it and a *panics.PanicError Blocking:
+    until reqs is closed, ctx is done or a request panics; senders block
+    until the owner receives Tags: concurrency, confinement, channel, owner,
+    shared-state, generic
+
+
+TYPES
+
+type Guarded[T any] struct {
+	// Has unexported fields.
+}
+    Guarded is a value of type T behind its own mutex: the only ways to reach
+    the value are Do, which runs a function on it under the lock, and Load,
+    which returns a copy taken under the lock. Every write made in one Do is
+    visible to every later Do and Load (the Go memory model's rule for Unlock
+    before Lock).
+
+    The zero value is ready to use and holds T's zero value. A Guarded holds a
+    sync.Mutex: it must not be copied after first use (go vet copylocks reports
+    a copy); pass *Guarded[T] or keep it in a struct used by pointer.
+
+    ID: TB-GUARD-001 Pattern: mutual exclusion (a mutex beside the value it
+    guards) Authority: The Go Memory Model, go.dev, "Synchronization", "Locks"
+    Authority: Effective Go, go.dev, "Concurrency", "Share by communicating"
+    Goroutines: none; Do's fn runs on the caller's goroutine Blocking:
+    Do and Load wait for the mutex (not cancellable, like sync.Mutex.Lock);
+    keep fn short Tags: concurrency, mutex, lock, shared-state, generic
+
+func (g *Guarded[T]) Do(fn func(*T))
+    Do locks g, calls fn with a pointer to the guarded value and unlocks g when
+    fn returns. A nil fn is a no-op.
+
+    The pointer is valid only until fn returns: keeping it, sending it elsewhere
+    or handing it to a goroutine and using it after fn returns is a data race
+    this type cannot prevent; the same holds for maps, slices and pointers
+    inside T. fn must not call Do or Load on the same g: sync.Mutex is not
+    re-entrant and that call deadlocks. A panic in fn is not recovered: g is
+    unlocked first (deferred), then the panic continues up the caller's stack,
+    so the next Do does not deadlock; the value keeps whatever fn wrote before
+    panicking. Wrap the call in panics.Try to turn that panic into an error.
+
+func (g *Guarded[T]) Load() T
+    Load returns a copy of the guarded value, taken under the lock. The copy
+    is shallow: a map, slice, pointer or channel inside T still refers to the
+    guarded data, and reading or writing through it outside Do is a data race.
+    For such a T, copy deeply inside Do instead.
+
+=== package lifecycle
+package lifecycle // import "github.com/CrimsonCoder42/toolbench/lifecycle"
+
+Package lifecycle starts the parts of a process in order and stops them
+gracefully, in reverse, within a drain deadline: the run group of a main
+function. Group.Run calls each Component's Start in the order it was added,
+waits until its ctx is done (a signal, through WithNotify), then calls the
+Stop of every started component in reverse order under one grace deadline,
+as net/http Server.Shutdown drains with a deadline. A Start that fails stops
+the components already started, in reverse. Run is the one-component form:
+a blocking start (a server's Serve) and the stops that end it.
+
+Stop errors are all returned (errors.Join), each naming its component.
+A component that has not stopped when the grace period ends is named in
+an ErrStopTimeout error and Run returns at once: the process is about
+to exit, and a stuck Stop must not hold it (The Twelve-Factor App, "IX.
+Disposability"). A panic in Start, Stop or the notify hook is recovered
+and returned as panics.ErrPanic. Nothing here panics on input: a nil ctx is
+context.Background(), a non-positive grace is DefaultGrace, a nil Start or Stop
+does nothing, a second Run is ErrClosed. The package never imports os/signal:
+the caller passes signal.NotifyContext through WithNotify.
+
+ID short form: LIFE (IDs are TB-LIFE-NNN).
+
+Exports:
+
+    TB-LIFE-001  Stopper         a function that stops one component within the deadline of its ctx
+    TB-LIFE-002  Run             runs a blocking start until it returns or ctx is done, then the stops in reverse
+    TB-LIFE-003  Component       one part of a process: a Name, a Start and a Stop
+    TB-LIFE-004  Group           a run group: ordered start, reverse-order stop, drain deadline
+    TB-LIFE-005  Option          a functional option for Group.Run
+    TB-LIFE-006  WithGrace       the drain deadline for every Stop together (default DefaultGrace)
+    TB-LIFE-007  WithClock       the clock that measures the grace period (default clock.Real())
+    TB-LIFE-008  WithNotify      the shutdown hook, for example signal.NotifyContext (default none)
+    TB-LIFE-009  ErrClosed       returned by Run and Add once a Group has been run
+    TB-LIFE-010  ErrStopTimeout  the grace period ended before every component stopped
+    TB-LIFE-011  DefaultGrace    the grace period used when none (or a non-positive one) is given: 30s
+
+CONSTANTS
+
+const DefaultGrace = 30 * time.Second
+    DefaultGrace is the grace period when none, or a non-positive one, is given:
+    the time every Stop together has to return once shutdown begins. 30s is the
+    default termination grace period of common process managers (Kubernetes
+    terminationGracePeriodSeconds) and faktory's ShutdownTimeout is 25s;
+    choose one shorter than the manager's, which sends SIGKILL when it runs out.
+
+    ID: TB-LIFE-011 Pattern: graceful shutdown (drain deadline) Authority: The
+    Twelve-Factor App, "IX. Disposability" (https://12factor.net/disposability)
+    Tags: lifecycle, shutdown, deadline, default
+
+
+VARIABLES
+
+var ErrClosed = errors.New("lifecycle: group already run")
+    ErrClosed is returned by Group.Run and Group.Add once Run has been called
+    on the Group: a Group runs once, as an http.Server is not reused after
+    Shutdown. Match it with errors.Is.
+
+    ID: TB-LIFE-009 Pattern: sentinel error Authority: pkg.go.dev net/http,
+    "func (*Server) Shutdown" ("Once Shutdown has been called on a server,
+    it may not be reused") Tags: lifecycle, error, closed
+
+var ErrStopTimeout = errors.New("lifecycle: grace period ended before every component stopped")
+    ErrStopTimeout is matched (errors.Is) by the error Run returns when the
+    grace period ends before every Stop has returned. The message names the
+    component still stopping and every component whose Stop was not called.
+    It is also the cause (context.Cause) of the ctx given to the Stop that was
+    still running.
+
+    ID: TB-LIFE-010 Pattern: sentinel error (drain deadline exceeded) Authority:
+    pkg.go.dev net/http, "func (*Server) Shutdown" ("If the provided context
+    expires before the shutdown is complete, Shutdown returns the context's
+    error") Tags: lifecycle, error, shutdown, deadline
+
+
+FUNCTIONS
+
+func Run(ctx context.Context, grace time.Duration, start func(context.Context) error, stops ...Stopper) error
+    Run calls start(ctx) on its own goroutine and waits until start returns or
+    ctx is done. Then it calls the stops in reverse order (stops[len-1] first),
+    one at a time, and waits for start to return, all within grace (a grace <=
+    0 is DefaultGrace), measured on the real clock. Each stop gets a ctx that
+    keeps ctx's values, is not cancelled by ctx and is cancelled with cause
+    ErrStopTimeout when grace ends; when grace ends first, Run returns at once
+    with an ErrStopTimeout error naming the stop (or "start") still running and
+    the stops never called. A typical start is an http.Server's ListenAndServe
+    and a typical stop its Shutdown.
+
+    start's error is returned, wrapped as "lifecycle: start: ...", except, after
+    ctx is done, an error that matches ctx.Err() or context.Cause(ctx) (start
+    returning because it was cancelled is a clean stop); http.ErrServerClosed
+    is returned like any other error, so filter it in start. A start that
+    returns before ctx is done (nil or an error) begins the shutdown at once.
+    A nil start waits for ctx; a nil stop is skipped; a nil ctx is
+    context.Background(). If ctx is done before the call, start and the stops
+    are not called and Run returns context.Cause(ctx). For several components
+    started in order, use Group.
+
+    ID: TB-LIFE-002 Pattern: graceful shutdown (drain with deadline,
+    reverse-order stop) Authority: pkg.go.dev net/http, "func (*Server)
+    Shutdown" Authority: The Twelve-Factor App, "IX. Disposability"
+    (https://12factor.net/disposability) Goroutines: one for start, one per
+    stop (one at a time); all have exited when Run returns, except those still
+    running when grace ends (named in the error; D-027): a stuck stop leaves
+    one, a stuck start at most two (start's own and the one waiting for it),
+    each ending when that call returns Cancel: ctx done before the call: nothing
+    runs, the cause is returned; while start runs: the shutdown begins Errors:
+    start's error and every stop error, errors.Join, each named; ErrStopTimeout;
+    a panic is panics.ErrPanic Blocking: until start has returned and every stop
+    has returned, or grace has ended Tags: lifecycle, shutdown, graceful, drain,
+    server
+
+
+TYPES
+
+type Component struct {
+	Name  string
+	Start func(ctx context.Context) error
+	Stop  Stopper
+}
+    Component is one part of a process that Group starts and stops: a database
+    pool, a cache, a consumer, a server. Start is called once, in Add order, and
+    returns when the component is up (nil) or could not be started (an error);
+    it does not block for the component's lifetime. Work that outlives Start (a
+    server's Serve, a consumer loop) runs on goroutines that Stop ends and waits
+    for: derive their context from context.WithoutCancel(ctx) so that Stop,
+    in reverse order, ends them rather than the signal. Stop is called once, in
+    reverse order, only if Start returned nil. A nil Start is a component that
+    needs no start; a nil Stop one that needs no stop. Name is used in errors;
+    empty is "component <n>" (n counts from 1 in Add order). The zero value is a
+    component that does nothing.
+
+    ID: TB-LIFE-003 Pattern: graceful shutdown (ordered start, reverse-order
+    stop) Authority: pkg.go.dev net/http, "func (*Server) Shutdown", "func
+    (*Server) RegisterOnShutdown" Tags: lifecycle, component, start, stop
+
+type Group struct {
+	// Has unexported fields.
+}
+    Group is a run group with ordered start and reverse-order stop. Add the
+    components, then Run starts them in Add order, waits until ctx (or the
+    WithNotify context) is done, and stops the started ones in reverse order
+    within the grace period. A Group runs once. The zero value is ready to use;
+    a Group must not be copied after first use. Add and Run are safe for
+    concurrent use.
+
+    ID: TB-LIFE-004 Pattern: graceful shutdown (run group, ordered start,
+    reverse-order stop, drain deadline) Authority: pkg.go.dev net/http,
+    "func (*Server) Shutdown" Authority: pkg.go.dev os/signal, "func
+    NotifyContext" Authority: The Twelve-Factor App, "IX. Disposability"
+    (https://12factor.net/disposability) Goroutines: Run starts one per Stop,
+    one at a time; each has exited when Run returns, except a Stop still
+    running when the grace period ends (named in the error; it ends when that
+    Stop returns) Cancel: ctx done before every Start was called: the rest are
+    not started, the started ones are stopped, Run returns the cause; after:
+    shutdown, Run returns the stop errors Errors: a Start error (or panic) and
+    every Stop error (or panic), errors.Join; ErrStopTimeout; ErrClosed on a
+    second Run; panics are panics.ErrPanic Blocking: Run blocks until shutdown
+    has finished or the grace period has ended Tags: lifecycle, shutdown,
+    graceful, signal, run group
+
+func (g *Group) Add(c Component) error
+    Add appends c to the components Run starts, after those already added.
+    It returns ErrClosed, and c is not added, once Run has been called.
+
+func (g *Group) Run(ctx context.Context, opts ...Option) error
+    Run starts the components and stops them; it returns when every started
+    component has stopped or the grace period has ended.
+
+    Start: with WithNotify, notify(ctx) is called first and its context replaces
+    ctx. Then each Start is called on Run's goroutine with ctx, in Add order;
+    component k+1 starts only after Start k returned nil. If Start k returns an
+    error or panics, components k+1.. are not started and k-1..1 are stopped
+    in reverse; k is not stopped (a failed Start cleans up after itself, as a
+    constructor that returns an error). If ctx is done before Start k is called,
+    the same happens to 1..k-1 and Run returns context.Cause(ctx).
+
+    Wait: once every component has started, Run waits for ctx to be done.
+
+    Stop: the Stop of every started component is called in reverse order,
+    one at a time, each with a ctx that keeps ctx's values, is not cancelled
+    by ctx, and is cancelled with cause ErrStopTimeout when the grace period
+    (WithGrace, measured on WithClock) ends. The stop ctx has no Deadline,
+    since the clock may be fake. When the grace period ends first, Run returns
+    at once with an ErrStopTimeout error naming the component still stopping and
+    those never stopped. A clean shutdown returns nil; otherwise the start error
+    and every stop error, errors.Join, each naming its component. A nil ctx is
+    context.Background(). A second Run returns ErrClosed. A Start that calls
+    runtime.Goexit ends Run's goroutine, as it would any caller.
+
+type Option func(*config)
+    Option configures Group.Run. A nil Option is skipped.
+
+    ID: TB-LIFE-005 Pattern: functional options Authority: Pike,
+    "Self-referential functions and the design of options", command center
+    (blog), 2014 Tags: lifecycle, options
+
+func WithClock(c clock.Clock) Option
+    WithClock sets the clock that measures the grace period (default
+    clock.Real(); nil is clock.Real()). Tests pass a *clock.Fake.
+
+    ID: TB-LIFE-007 Pattern: injected clock (test double seam) Authority:
+    pkg.go.dev time, "func NewTimer" Tags: lifecycle, clock, option, testing
+
+func WithGrace(d time.Duration) Option
+    WithGrace sets the grace period: once shutdown begins, every Stop together
+    has d to return, measured on the clock from WithClock. A d <= 0 is
+    DefaultGrace.
+
+    ID: TB-LIFE-006 Pattern: graceful shutdown (drain deadline) Authority:
+    pkg.go.dev net/http, "func (*Server) Shutdown" Tags: lifecycle, shutdown,
+    deadline, option
+
+func WithNotify(notify func(context.Context) (context.Context, context.CancelFunc)) Option
+    WithNotify sets the shutdown hook. Run calls notify(ctx) once, before the
+    first Start, and uses the context it returns in place of ctx: when that
+    context is done, shutdown begins. The CancelFunc is called when Run returns.
+    Its shape is os/signal.NotifyContext's, so a main passes
+
+        lifecycle.WithNotify(func(ctx context.Context) (context.Context, context.CancelFunc) {
+        	return signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+        })
+
+    and this package never imports os/signal. A nil notify is no hook (the
+    default); a nil context returned is ctx, a nil CancelFunc is not called;
+    a panic in notify is returned by Run as panics.ErrPanic.
+
+    ID: TB-LIFE-008 Pattern: graceful shutdown (termination signal hook)
+    Authority: pkg.go.dev os/signal, "func NotifyContext" Authority: The
+    Twelve-Factor App, "IX. Disposability" ("Processes shut down gracefully when
+    they receive a SIGTERM signal") Tags: lifecycle, signal, shutdown, option
+
+type Stopper func(ctx context.Context) error
+    Stopper stops one component. It should return once the component has stopped
+    (connections drained, work finished, goroutines ended), or when ctx is done,
+    with ctx's error: the shape of http.Server.Shutdown, so srv.Shutdown is a
+    Stopper. ctx is cancelled with cause ErrStopTimeout when the grace period
+    ends; a Stopper that ignores it is abandoned and named in Run's error.
+    A nil Stopper is skipped: Run and Group.Run never call it, and it counts as
+    stopped.
+
+    ID: TB-LIFE-001 Pattern: graceful shutdown (drain with deadline) Authority:
+    pkg.go.dev net/http, "func (*Server) Shutdown" Errors: its error is returned
+    by Run wrapped with the component's name, joined with the others Blocking:
+    until the component has stopped or ctx is done Tags: lifecycle, shutdown,
+    stop, drain
+
+=== package pool
+package pool // import "github.com/CrimsonCoder42/toolbench/pool"
+
+Package pool is a long-lived worker pool (competing consumers): New starts a
+fixed number of workers that take values from one queue and call fn on each;
+Submit hands a value to the pool and blocks while the queue is full
+(backpressure, never a drop); Close stops accepting, lets the workers finish
+every accepted value and waits for them. The workers run in a group.Group,
+so a panic in fn is recovered and returned as panics.ErrPanic, and with
+WithFailFast the first error cancels the pool. By default every error is kept
+and Close returns them joined (errors.Join). Nothing here panics on input:
+a nil ctx is context.Background(), a non-positive worker count is ErrWorkers,
+Submit after Close is ErrClosed.
+
+For a fixed batch of tasks use group (fork-join) or parallel (Map, Filter,
+ForEach); pool is for values that arrive over time and are processed by the same
+bounded set of workers.
+
+ID short form: POOL (IDs are TB-POOL-NNN).
+
+Exports:
+
+    TB-POOL-001  Pool          a worker pool: workers started by New, Submit with backpressure, Close drains and waits
+    TB-POOL-002  New           starts a Pool of workers calling fn on each submitted value
+    TB-POOL-003  Option        a functional option for New
+    TB-POOL-004  WithQueue     how many submitted values may wait for a worker (default 0: direct hand-off)
+    TB-POOL-005  WithFailFast  the first error cancels the pool and is what Close returns (default: collect all)
+    TB-POOL-006  ErrClosed     returned by Submit after Close has been called
+    TB-POOL-007  ErrWorkers    returned by New when the worker count is not positive
+
+VARIABLES
+
+var ErrClosed = errors.New("pool: closed")
+    ErrClosed is returned by Submit when Close has been called: the value was
+    not accepted and fn will not see it. Match it with errors.Is.
+
+    ID: TB-POOL-006 Pattern: sentinel error Authority: pkg.go.dev net/http,
+    "ErrServerClosed" (the standard library's after-close sentinel) Tags: pool,
+    error, closed
+
+var ErrWorkers = errors.New("pool: worker count must be positive")
+    ErrWorkers is returned, wrapped with the count, by New when the worker
+    count is zero or negative: a pool with no workers could never run a value.
+    Match it with errors.Is.
+
+    ID: TB-POOL-007 Pattern: sentinel error Authority: pkg.go.dev errors,
+    "Is" Tags: pool, error, workers
+
+
+TYPES
+
+type Option func(*config)
+    Option configures a Pool; pass options to New. The zero set of options is a
+    direct hand-off (no queue) and collect-all errors.
+
+    ID: TB-POOL-003 Pattern: functional options Authority: Pike,
+    "Self-referential functions and the design of options", command center
+    (blog), 2014 Tags: pool, options
+
+func WithFailFast() Option
+    WithFailFast makes the first error (fn's error or a recovered panic) cancel
+    the pool's context: workers stop after their current fn call, Submit
+    returns that error, values still queued are not run (at most one per worker
+    may still start, with a done ctx), and Close returns that first error,
+    joined with a count of the values left unrun when there are any. Without it
+    (the default) every error is kept, the workers keep going, and Close returns
+    them joined with errors.Join.
+
+    ID: TB-POOL-005 Pattern: error group (first error cancels) Authority:
+    pkg.go.dev golang.org/x/sync/errgroup v0.25.0, "func WithContext" Tags:
+    pool, options, errors, cancel
+
+func WithQueue(n int) Option
+    WithQueue lets up to n submitted values wait for a free worker, so Submit
+    returns before a worker takes the value. The default, and any n <= 0, is 0:
+    Submit hands the value directly to a free worker and blocks until one takes
+    it. The queue never grows past n: a full queue blocks Submit (backpressure,
+    no drop).
+
+    ID: TB-POOL-004 Pattern: bounded queue (backpressure) Authority: Ajmani,
+    "Go Concurrency Patterns: Pipelines and cancellation", The Go Blog, 2014,
+    "Bounded parallelism" Tags: pool, options, queue, backpressure
+
+type Pool[T any] struct {
+	// Has unexported fields.
+}
+    Pool is a worker pool: a fixed set of workers, started by New, competing
+    for values on one bounded queue and calling fn on each. Submit adds a value
+    and blocks while the queue is full; Close stops accepting, waits until every
+    accepted value has been run (or the pool's ctx has ended) and returns the
+    errors. Each accepted value is given to exactly one worker, at most once.
+    Create it with New; the zero value is not usable (Submit returns ErrClosed,
+    Close returns nil). A Pool must not be copied.
+
+    ID: TB-POOL-001 Pattern: worker pool (competing consumers, bounded
+    parallelism) Authority: Ajmani, "Go Concurrency Patterns: Pipelines and
+    cancellation", The Go Blog, 2014, "Bounded parallelism" Authority: Hohpe &
+    Woolf, Enterprise Integration Patterns, Addison-Wesley, 2003, "Competing
+    Consumers" Goroutines: workers, started by New, run in a group.Group;
+    all have exited when Close returns Cancel: the pool's ctx (New's ctx,
+    or the first error with WithFailFast) ends: workers stop after their current
+    fn call (at most one queued value per worker may still start, with a done
+    ctx); the rest of the queue is not run and Close reports how many Errors:
+    Close: every fn error and recovered panic joined (default) or the first
+    one (WithFailFast), joined with a count of values left unrun that wraps
+    context.Cause Blocking: Submit blocks while every worker is busy and the
+    queue is full; Close blocks until the workers have exited Tags: concurrency,
+    workers, pool, backpressure, queue, panic
+
+func New[T any](ctx context.Context, workers int, fn func(context.Context, T) error, opts ...Option) (*Pool[T], error)
+    New starts workers goroutines that each take values from the pool's queue
+    and call fn(ctx, v), where ctx is the pool's context: ctx itself, or with
+    WithFailFast a child of it that is cancelled on the first error. A nil
+    ctx is context.Background(). A nil fn panics on each value and so returns
+    panics.ErrPanic through Close. A worker whose fn calls runtime.Goexit is
+    replaced, so the pool keeps its worker count.
+
+    ID: TB-POOL-002 Pattern: worker pool (competing consumers, bounded
+    parallelism) Authority: Ajmani, "Go Concurrency Patterns: Pipelines and
+    cancellation", The Go Blog, 2014, "Bounded parallelism" Authority: Hohpe &
+    Woolf, Enterprise Integration Patterns, Addison-Wesley, 2003, "Competing
+    Consumers" Goroutines: workers; each ends when the queue is closed and empty
+    or the pool's ctx is done; all have exited when Close returns Cancel: ctx
+    done before New: the workers exit at once, Submit returns context.Cause(ctx)
+    Errors: ErrWorkers (wrapped with the count) when workers <= 0; no goroutine
+    is started then Blocking: never Tags: concurrency, workers, pool,
+    constructor
+
+func (p *Pool[T]) Close() error
+    Close stops the pool accepting values (a Submit blocked on a full queue
+    returns ErrClosed), lets the workers run every value already accepted,
+    waits until they have all exited and returns the errors. By default it
+    returns every fn error and recovered panic joined with errors.Join (nil when
+    there were none); with WithFailFast it returns the first. If the pool's ctx
+    ended before the queue was empty, the values left unrun are reported as an
+    error that wraps context.Cause of the pool's ctx, joined with the errors
+    above (so errors.Is still matches the first error). Close is idempotent:
+    every call returns the first call's result. It must not be called from
+    inside fn (it would wait for itself).
+
+func (p *Pool[T]) Submit(ctx context.Context, v T) error
+    Submit gives v to the pool. It returns nil once a worker or the queue
+    has taken v; it blocks while every worker is busy and the queue is full
+    (backpressure: nothing is dropped). It returns ErrClosed after Close has
+    been called, context.Cause(ctx) when ctx is done, and context.Cause of the
+    pool's ctx when the pool has stopped (New's ctx ended, or the first error
+    with WithFailFast). A value for which Submit returned an error was not
+    accepted. A nil ctx is context.Background(). Submit is safe for concurrent
+    use, also with Close. fn must not call Submit on its own pool without a
+    queue to spare: with every worker inside fn it would wait forever.
+
+=== package retry
+package retry // import "github.com/CrimsonCoder42/toolbench/retry"
+
+Package retry calls a function again when it fails, waiting between attempts
+by a capped exponential backoff with jitter. Do and DoValue make at most
+WithAttempts attempts (default 3), wait the delay a Backoff gives (default
+FullJitter, base 100 ms, max 10 s) on a clock.Clock (WithClock), stop at once
+on an error marked Permanent or one WithRetryIf rejects (by default a context
+error and panics.ErrPanic), and return ErrExhausted wrapping the last error when
+every attempt failed. WithAttemptTimeout bounds each attempt. The delays are
+calcbench algo/backoff (ALG-BACKOF-001..004), drawn from the WithRand source.
+Retry only work that is safe to repeat (idempotent): a call that failed after
+its side effect happened runs again.
+
+ID short form: RETRY (IDs are TB-RETRY-NNN).
+
+Exports:
+
+    TB-RETRY-001  Do                  calls fn until it succeeds, an error stops it, or the attempts run out
+    TB-RETRY-002  DoValue             Do for a function that returns a value
+    TB-RETRY-003  Permanent           marks an error as not retryable; errors.Is and errors.As still see it
+    TB-RETRY-004  ErrExhausted        every attempt failed; wraps the last attempt's error
+    TB-RETRY-005  ErrAttemptTimeout   the cause of an attempt's ctx when WithAttemptTimeout expires
+    TB-RETRY-006  Backoff             the delay between attempts: one calcbench backoff function, base and max
+    TB-RETRY-007  Exponential         a Backoff of min(max, base·2^k), no jitter
+    TB-RETRY-008  FullJitter          a Backoff of a uniform draw in [0, min(max, base·2^k))
+    TB-RETRY-009  EqualJitter         a Backoff of half of min(max, base·2^k) plus a draw in the other half
+    TB-RETRY-010  DecorrelatedJitter  a Backoff of min(max, a draw in [base, 3·previous delay))
+    TB-RETRY-011  Option              configures Do and DoValue
+    TB-RETRY-012  WithAttempts        sets the total number of attempts (default 3)
+    TB-RETRY-013  WithBackoff         sets the Backoff (default FullJitter(100ms, 10s))
+    TB-RETRY-014  WithAttemptTimeout  bounds each attempt; its ctx ends with ErrAttemptTimeout as the cause
+    TB-RETRY-015  WithRetryIf         decides which errors are retried (default: all but context errors and ErrPanic)
+    TB-RETRY-016  WithOnRetry         calls a function before each wait with the attempt, its error and the wait
+    TB-RETRY-017  WithClock           sets the clock the waits and attempt timeouts use (default clock.Real)
+    TB-RETRY-018  WithRand            sets the random source of the jitter draws (default math/rand/v2's top-level source)
+
+VARIABLES
+
+var ErrAttemptTimeout = errors.New("retry: attempt timed out")
+    ErrAttemptTimeout is the cause (context.Cause) of an attempt's ctx when
+    WithAttemptTimeout expires, and it is wrapped into the error of an attempt
+    that failed after its timeout. Match it with errors.Is.
+
+    ID: TB-RETRY-005 Pattern: sentinel error Authority: pkg.go.dev context,
+    "func WithTimeoutCause" Tags: errors, sentinel, retry, timeout
+
+var ErrExhausted = errors.New("retry: attempts exhausted")
+    ErrExhausted is returned when every attempt failed with a retryable error.
+    It wraps the last attempt's error: errors.Is matches both ErrExhausted and
+    that error.
+
+    ID: TB-RETRY-004 Pattern: sentinel error Authority: Azure Architecture
+    Center, "Retry pattern", Microsoft Learn, 2024, "Solution" ("unsuccessful
+    after a predefined number of attempts") Tags: errors, sentinel, retry
+
+
+FUNCTIONS
+
+func Do(ctx context.Context, fn func(context.Context) error, opts ...Option) error
+    Do calls fn, on the calling goroutine, until it returns nil, returns
+    an error that is not retried, ctx is done, or WithAttempts attempts
+    (default 3) have failed. Between attempts it waits the Backoff's delay
+    (default FullJitter(100ms, 10s)) on the WithClock clock. A nil ctx is
+    context.Background(); a nil fn is a panic in fn (panics.ErrPanic).
+
+    ID: TB-RETRY-001 Pattern: retry with capped exponential backoff and jitter
+    Authority: Azure Architecture Center, "Retry pattern", Microsoft Learn,
+    2024, "Retry strategies" Authority: Brooker, "Exponential Backoff And
+    Jitter", AWS Architecture Blog, 2015, "Adding Jitter" Authority: Nygard,
+    Release It!, 2nd ed., Pragmatic Bookshelf, 2018, ch.5 "Stability Patterns"
+    (book, not opened) Goroutines: none; fn runs on the caller's goroutine
+    (with WithAttemptTimeout and a clock other than clock.Real, the clock
+    runs the timeout's cancel, which has returned or been stopped when Do
+    returns) Cancel: ctx done before an attempt or during a wait: Do returns
+    context.Cause(ctx) at once without another attempt; ctx done during fn:
+    fn sees it and Do returns context.Cause(ctx); either way wrapped with the
+    last attempt's error when there is one that is not ctx's own error Errors:
+    nil on success; an error marked Permanent, or rejected by WithRetryIf,
+    is returned unchanged at once; a panic in fn is panics.ErrPanic (not retried
+    by default); after the last attempt, ErrExhausted wrapping the last error; a
+    panic in a WithRetryIf or WithOnRetry function is panics.ErrPanic Blocking:
+    while fn runs and during each wait (one clock timer, stopped on return)
+    Math: ALG-BACKOF-001, ALG-BACKOF-002, ALG-BACKOF-003, ALG-BACKOF-004 Tags:
+    retry, backoff, jitter, resilience, timeout, cancellation
+
+func DoValue[T any](ctx context.Context, fn func(context.Context) (T, error), opts ...Option) (T, error)
+    DoValue is Do for a function that returns a value: it returns the value of
+    the attempt that succeeded, or T's zero value with the error.
+
+    ID: TB-RETRY-002 Pattern: retry with capped exponential backoff and jitter
+    Authority: Azure Architecture Center, "Retry pattern", Microsoft Learn,
+    2024, "Retry strategies" Authority: Brooker, "Exponential Backoff And
+    Jitter", AWS Architecture Blog, 2015, "Adding Jitter" Goroutines: none;
+    as Do Cancel: as Do Errors: as Do; the value is T's zero value whenever
+    the error is not nil Blocking: as Do Math: ALG-BACKOF-001, ALG-BACKOF-002,
+    ALG-BACKOF-003, ALG-BACKOF-004 Tags: retry, backoff, jitter, resilience,
+    generic
+
+func Permanent(err error) error
+    Permanent marks err as not retryable: when fn returns it (or an error
+    that wraps it), Do stops at once and returns fn's error unchanged,
+    not ErrExhausted. The marker is transparent: Error() is err's message,
+    and errors.Is and errors.As see err and everything it wraps. Permanent(nil)
+    is nil.
+
+    ID: TB-RETRY-003 Pattern: non-retryable error marker (Retry pattern "Cancel"
+    strategy) Authority: Azure Architecture Center, "Retry pattern", Microsoft
+    Learn, 2024, "Retry strategies" (Cancel) Errors: returns a wrapper of err;
+    nil for a nil err Tags: retry, errors, permanent
+
+
+TYPES
+
+type Backoff struct {
+	// Has unexported fields.
+}
+    Backoff is the delay between attempts: one of Brooker's capped exponential
+    schedules (Exponential, FullJitter, EqualJitter, DecorrelatedJitter) with
+    its base and cap. Every delay is computed by calcbench algo/backoff;
+    nothing is computed here. Create one with those functions. The zero value is
+    FullJitter with base 100 ms and max 10 s. A base <= 0 is 100 ms; a max <= 0
+    is the larger of 10 s and base; a max below base is base (so Exponential(d,
+    d) is a constant delay d). A Backoff is a value and safe to copy and share.
+
+    ID: TB-RETRY-006 Pattern: capped exponential backoff with jitter Authority:
+    Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015,
+    "Adding Jitter" Tags: retry, backoff, jitter, duration
+
+func DecorrelatedJitter(base, max time.Duration) Backoff
+    DecorrelatedJitter returns a Backoff whose wait is min(max, a uniform draw
+    in [base, 3·prev)), where prev is the previous wait of the same Do call
+    (base before the first retry).
+
+    ID: TB-RETRY-010 Pattern: decorrelated jitter Authority: Brooker,
+    "Exponential Backoff And Jitter", AWS Architecture Blog, 2015, "Adding
+    Jitter" (Decorrelated Jitter) Math: ALG-BACKOF-004 Tags: retry, backoff,
+    jitter, decorrelated-jitter, duration
+
+func EqualJitter(base, max time.Duration) Backoff
+    EqualJitter returns a Backoff whose wait before retry k keeps half of s =
+    min(max, base·2^k) and adds a uniform draw in [0, s/2): a value in [⌈s/2⌉,
+    s].
+
+    ID: TB-RETRY-009 Pattern: equal jitter Authority: Brooker, "Exponential
+    Backoff And Jitter", AWS Architecture Blog, 2015, "Adding Jitter" (Equal
+    Jitter) Math: ALG-BACKOF-003 Tags: retry, backoff, jitter, equal-jitter,
+    duration
+
+func Exponential(base, max time.Duration) Backoff
+    Exponential returns a Backoff with no jitter: the wait before retry k (k =
+    0 for the first retry) is min(max, base·2^k), saturating. Exponential(d,
+    d) waits d every time.
+
+    ID: TB-RETRY-007 Pattern: capped exponential backoff Authority:
+    Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015,
+    "Adding Backoff" Authority: gRPC, "Connection Backoff Protocol", grpc/grpc
+    doc/connection-backoff.md, "Proposed Backoff Algorithm" Math: ALG-BACKOF-001
+    Tags: retry, backoff, exponential, duration
+
+func FullJitter(base, max time.Duration) Backoff
+    FullJitter returns a Backoff whose wait before retry k is a uniform draw
+    in [0, min(max, base·2^k)). It is the default (base 100 ms, max 10 s):
+    Brooker finds it does the least work of the schedules he compares.
+
+    ID: TB-RETRY-008 Pattern: full jitter Authority: Brooker, "Exponential
+    Backoff And Jitter", AWS Architecture Blog, 2015, "Adding Jitter" (Full
+    Jitter) Math: ALG-BACKOF-002 Tags: retry, backoff, jitter, full-jitter,
+    duration
+
+type Option func(*config)
+    Option configures Do and DoValue. The zero value (a nil Option) is ignored.
+
+    ID: TB-RETRY-011 Pattern: functional options Authority: Pike,
+    "Self-referential functions and the design of options", command center
+    (blog), 2014 Tags: options, configuration
+
+func WithAttemptTimeout(d time.Duration) Option
+    WithAttemptTimeout bounds each attempt to d: fn gets a ctx that
+    ends d after the attempt starts, with context.Cause equal to an
+    error matching ErrAttemptTimeout. With clock.Real the ctx is made by
+    context.WithTimeoutCause, so it carries a deadline and ctx.Err() is
+    context.DeadlineExceeded; with any other clock (clock.Fake in tests) it
+    is cancelled by the clock's AfterFunc, has no deadline, and ctx.Err() is
+    context.Canceled. An attempt that fails after its timeout returns an error
+    matching both ErrAttemptTimeout and fn's error, and the default WithRetryIf
+    retries it. fn must honour its ctx: Do waits for fn to return. The default,
+    and a d <= 0, is no per-attempt timeout.
+
+    ID: TB-RETRY-014 Pattern: timeout (per attempt, with cause) Authority:
+    Nygard, Release It!, 2nd ed., Pragmatic Bookshelf, 2018, ch.5 "Stability
+    Patterns", "Timeouts" (book, not opened) Authority: pkg.go.dev context,
+    "func WithTimeoutCause" and "func WithCancelCause" Tags: options, retry,
+    timeout, context, cause
+
+func WithAttempts(n int) Option
+    WithAttempts sets the total number of attempts, the first call included:
+    WithAttempts(1) calls fn once and never retries. The default, and an n <= 0,
+    is 3. There is no unbounded setting.
+
+    ID: TB-RETRY-012 Pattern: bounded retry count Authority: Azure Architecture
+    Center, "Retry pattern", Microsoft Learn, 2024, "Retry strategies" ("until
+    some maximum number of requests have been attempted") Tags: options, retry,
+    bound
+
+func WithBackoff(b Backoff) Option
+    WithBackoff sets the delay between attempts. The default, and the zero
+    Backoff, is FullJitter(100ms, 10s).
+
+    ID: TB-RETRY-013 Pattern: capped exponential backoff with jitter Authority:
+    Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015,
+    "Adding Jitter" Tags: options, retry, backoff, jitter
+
+func WithClock(c clock.Clock) Option
+    WithClock sets the clock the waits and the WithAttemptTimeout timers use.
+    The default, and a nil c, is clock.Real(). Tests pass a *clock.Fake and move
+    time with AdvanceContext.
+
+    ID: TB-RETRY-017 Pattern: injected clock (test double seam) Authority:
+    pkg.go.dev time, "func NewTimer" and "func AfterFunc" Tags: options, clock,
+    time, testing
+
+func WithOnRetry(f func(attempt int, err error, wait time.Duration)) Option
+    WithOnRetry calls f before each wait, on the caller's goroutine, with the
+    number of the attempt that failed (1 for the first call), its error and
+    the wait that follows. It is not called after the last attempt or for
+    an error that is not retried. A panic in f stops Do and is returned as
+    panics.ErrPanic. Default: none.
+
+    ID: TB-RETRY-016 Pattern: observer hook Authority: Azure Architecture
+    Center, "Retry pattern", Microsoft Learn, 2024, "General guidance" ("Log
+    all connectivity failures that cause a retry") Tags: options, retry, hook,
+    observability
+
+func WithRand(r *rand.Rand) Option
+    WithRand sets the source of the uniform draws the jittered Backoffs
+    use (math/rand/v2). The default, and a nil r, is the top-level
+    math/rand/v2 source. r is used only from the calling goroutine:
+    do not share one r between Do calls that run at the same time. Tests pass
+    rand.New(rand.NewPCG(seed1, seed2)).
+
+    ID: TB-RETRY-018 Pattern: dependency injection (injected random source)
+    Authority: pkg.go.dev math/rand/v2, "func New" and "func NewPCG" Tags:
+    options, random, jitter, testing
+
+func WithRetryIf(f func(error) bool) Option
+    WithRetryIf sets the function that decides whether an attempt's error is
+    retried; false returns that error unchanged at once. It is not called for an
+    error marked Permanent (never retried) or after ctx is done. The default,
+    and a nil f, retries every error except one matching panics.ErrPanic,
+    context.Canceled or context.DeadlineExceeded, and retries an attempt that
+    ended by WithAttemptTimeout. f runs on the caller's goroutine; a panic in f
+    is returned as panics.ErrPanic.
+
+    ID: TB-RETRY-015 Pattern: retry predicate (transient-fault detection)
+    Authority: Azure Architecture Center, "Retry pattern", Microsoft Learn,
+    2024, "Retry strategies" and "Exception type" Tags: options, retry, errors,
+    predicate
+
+=== package pubsub
+package pubsub // import "github.com/CrimsonCoder42/toolbench/pubsub"
+
+Package pubsub is in-process publish-subscribe: a Bus delivers a copy of every
+message published on a topic to each subscriber of that topic (Publish-Subscribe
+Channel), by calling the subscriber's handler on the subscriber's own goroutine
+(Event-Driven Consumer). Publisher and Subscriber are the two small interfaces
+the Bus implements and that later packages (jobs, outbox) and the adapters
+(Redis, Kafka, RabbitMQ) implement for an outside broker.
+
+Delivery is AT-MOST-ONCE inside the process: a message reaches each subscriber
+registered when it is published at most once, and is lost when the subscriber
+leaves (ctx cancelled, handler error, Close) before handling it; those losses
+are never silent: Subscribe's error counts them, and WithDropOldest reports
+each message it drops. A slow subscriber slows Publish (backpressure) unless
+WithDropOldest is passed. Every subscriber of a topic sees that topic's messages
+in the same order. The Bus starts no goroutine: Subscribe runs its loop on the
+caller's goroutine and returns when its ctx is done, the Bus is closed or the
+handler fails, with the handler finished. A panic in a handler is returned as
+panics.ErrPanic. Nothing panics on input.
+
+ID short form: PUBSUB (IDs are TB-PUBSUB-NNN).
+
+Exports:
+
+    TB-PUBSUB-001  Publisher          publishes messages on a topic (the interface the Bus and broker adapters implement)
+    TB-PUBSUB-002  Subscriber         calls a handler for each message on a topic until ctx is done (the interface the Bus and broker adapters implement)
+    TB-PUBSUB-003  Bus                an in-process publish-subscribe channel: a copy of each message to every subscriber of its topic
+    TB-PUBSUB-004  NewBus             creates a Bus with options
+    TB-PUBSUB-005  Option             a functional option for NewBus
+    TB-PUBSUB-006  WithBuffer         how many messages may wait for each subscriber (default 0: direct hand-off)
+    TB-PUBSUB-007  WithDropOldest     a full subscriber buffer drops its oldest message and reports it, instead of blocking Publish
+    TB-PUBSUB-008  WithOnSubscribers  a hook called with a topic's subscriber count each time it changes
+    TB-PUBSUB-009  ErrClosed          returned by Publish and Subscribe once the Bus is closed
+    TB-PUBSUB-010  ErrInvalid         returned when a Bus is used with an argument or option it cannot run with
+
+VARIABLES
+
+var ErrClosed = errors.New("pubsub: bus closed")
+    ErrClosed is returned by Publish and Subscribe once Close has been called,
+    and is the cause of the ctx a running handler sees when the Bus is closed.
+    Match it with errors.Is.
+
+    ID: TB-PUBSUB-009 Pattern: sentinel error Authority: pkg.go.dev net/http,
+    "ErrServerClosed" (the standard library's after-close sentinel) Tags:
+    pubsub, error, closed
+
+var ErrInvalid = errors.New("pubsub: invalid argument")
+    ErrInvalid is returned, wrapped with what it names, by Subscribe for a nil
+    handler, and by Publish and Subscribe on a Bus created with WithBuffer above
+    2^20. Nothing is registered or delivered when it is returned. Match it with
+    errors.Is.
+
+    ID: TB-PUBSUB-010 Pattern: sentinel error Authority: pkg.go.dev errors,
+    "Is" Tags: pubsub, error, invalid
+
+
+TYPES
+
+type Bus[M any] struct {
+	// Has unexported fields.
+}
+    Bus is an in-process publish-subscribe channel: Publish delivers a copy of
+    each message to every subscriber registered on its topic when the message
+    is published, and Subscribe calls a handler for each message of its topic
+    on the caller's goroutine. It implements Publisher and Subscriber. Delivery
+    is at-most-once: a message is lost for a subscriber that leaves before
+    handling it (counted in that Subscribe's error) or, with WithDropOldest,
+    that falls behind (reported). Publish with no subscriber on the topic
+    delivers nothing and returns nil. Every subscriber of a topic sees that
+    topic's messages in one order, the order Publish calls were admitted,
+    each call's messages consecutively. Topics are independent and created on
+    first Subscribe. The zero value is ready to use (no buffer, backpressure,
+    no hook); NewBus sets options. A Bus must not be copied after first use.
+
+    ID: TB-PUBSUB-003 Pattern: publish-subscribe channel (event-driven
+    consumers) Authority: Hohpe & Woolf, Enterprise Integration Patterns,
+    Addison-Wesley, 2003, "Publish-Subscribe Channel" Authority: Hohpe & Woolf,
+    Enterprise Integration Patterns, Addison-Wesley, 2003, "Event-Driven
+    Consumer" Goroutines: none; Subscribe runs on the caller's goroutine and
+    has returned, its handler finished, when it returns Cancel: Publish returns
+    context.Cause(ctx) when its ctx ends while it waits (messages already
+    handed over stay delivered); Subscribe returns context.Cause(ctx) after
+    its current handler call Errors: ErrClosed after Close; ErrInvalid for a
+    nil handler or invalid options; a handler error or panic (panics.ErrPanic)
+    ends that Subscribe and is returned Blocking: Publish blocks while a
+    subscriber of the topic is busy and its buffer is full (backpressure),
+    unless WithDropOldest; Subscribe blocks for the whole subscription Math:
+    ALG-QUEUE-002 CircularBuffer (WithDropOldest only) Tags: concurrency,
+    pubsub, messaging, fan-out, backpressure, panic
+
+func NewBus[M any](opts ...Option[M]) *Bus[M]
+    NewBus returns a Bus configured by opts. A nil Option is ignored. WithBuffer
+    above 2^20 does not panic: the Bus is returned and its Publish and Subscribe
+    return ErrInvalid naming the option.
+
+    ID: TB-PUBSUB-004 Pattern: publish-subscribe channel (constructor)
+    Authority: Hohpe & Woolf, Enterprise Integration Patterns, Addison-Wesley,
+    2003, "Publish-Subscribe Channel" Blocking: never Tags: pubsub, constructor
+
+func (b *Bus[M]) Close() error
+    Close closes the Bus: Publish and Subscribe return ErrClosed from now on,
+    a Publish waiting on a subscriber returns ErrClosed, and every running
+    Subscribe's ctx is cancelled with cause ErrClosed, so each returns ErrClosed
+    once its current handler call has returned (Close does not wait for that:
+    the Subscribe callers own their goroutines). Messages still buffered are not
+    delivered and are counted in each Subscribe's error. Close always returns
+    nil; calling it again, or on the zero value or a nil *Bus, is a no-op.
+    It may be called from a handler.
+
+func (b *Bus[M]) Publish(ctx context.Context, topic string, msgs ...M) error
+    Publish delivers msgs, in order, to every subscriber registered on topic,
+    each message to all of them before the next. It returns nil once every
+    subscriber has taken (or buffered) every message; with no subscriber
+    on topic, or no msgs, it delivers nothing and returns nil. It blocks
+    while a subscriber is busy and its buffer is full (backpressure),
+    unless WithDropOldest; a subscriber that leaves while Publish waits on it
+    is skipped. Concurrent Publish calls on one topic take turns (one order for
+    every subscriber); different topics never wait for each other. It returns
+    ErrClosed after Close (also while waiting), context.Cause(ctx) when ctx
+    ends first, ErrInvalid for invalid options, and a panic in a WithDropOldest
+    report as panics.ErrPanic; on an error the messages already handed over stay
+    delivered and the rest are not published. A nil ctx is context.Background().
+    Safe for concurrent use, also from a handler (on another topic, or with
+    buffer to spare: a handler publishing to its own full, unbuffered topic
+    waits for itself).
+
+func (b *Bus[M]) Subscribe(ctx context.Context, topic string, h func(context.Context, M) error) (err error)
+    Subscribe registers h on topic and calls it for each message published
+    there from then on, one at a time on the calling goroutine, in the
+    topic's order, with a ctx that is cancelled when ctx is or when the Bus
+    closes (cause ErrClosed). It blocks until that ctx is done or h returns
+    an error, and returns after h has returned; it never returns nil.
+    The result is context.Cause(ctx), ErrClosed, h's error, or a panic in h as
+    panics.ErrPanic; when messages were left in this subscriber's buffer (lost:
+    at-most-once) it is wrapped as "pubsub: N buffered messages not delivered:
+    <reason>", so errors.Is still matches the reason. Unsubscribe by cancelling
+    ctx. It returns at once ErrClosed on a closed Bus, ErrInvalid for a nil
+    h or invalid options, and context.Cause(ctx) when ctx is already done.
+    A nil ctx is context.Background(). Safe for concurrent use; one topic may
+    have any number of subscribers, each with its own buffer.
+
+type Option[M any] func(*config[M])
+    Option configures a Bus[M]; pass options to NewBus. It is generic in the
+    Bus's message type, so an option for another message type does not compile.
+    The zero set of options is a direct hand-off to each subscriber (no buffer),
+    backpressure on a slow subscriber, and no hook. A nil Option is ignored by
+    NewBus.
+
+    ID: TB-PUBSUB-005 Pattern: functional options Authority: Pike,
+    "Self-referential functions and the design of options", command center
+    (blog), 2014 Tags: pubsub, options
+
+func WithBuffer[M any](n int) Option[M]
+    WithBuffer lets up to n messages wait for each subscriber, so Publish can
+    return before a slow subscriber's handler has taken them. The default,
+    and any n < 0, is 0: Publish hands each message directly to each subscriber
+    and blocks until that subscriber takes it. A subscriber's buffer never
+    grows past n: a full buffer blocks Publish (backpressure, no drop) unless
+    WithDropOldest is passed. n above 2^20 (1048576) makes the Bus invalid
+    (Publish and Subscribe return ErrInvalid). Each Subscribe allocates its own
+    buffer.
+
+    ID: TB-PUBSUB-006 Pattern: bounded queue (backpressure) Authority: Ajmani,
+    "Go Concurrency Patterns: Pipelines and cancellation", The Go Blog, 2014,
+    "Stopping short" Tags: pubsub, options, buffer, backpressure
+
+func WithDropOldest[M any](report func(topic string, m M)) Option[M]
+    WithDropOldest makes a full subscriber buffer drop its oldest message to
+    take the new one, instead of blocking Publish: a slow subscriber then
+    loses its oldest messages and never slows the publisher. Each dropped
+    message is passed to report(topic, m) on the publishing goroutine, after
+    the new message has been buffered and outside every lock. report must not
+    block for long and must not Publish on the same topic (that Publish would
+    wait for the one calling report). A nil report drops without reporting,
+    which the caller has then chosen explicitly. The buffer is WithBuffer's n,
+    at least 1 (WithDropOldest with no buffer keeps the newest message only).
+    M is inferred from report and must be the Bus's message type (checked by the
+    compiler). A panic in report is returned by Publish as panics.ErrPanic.
+
+    ID: TB-PUBSUB-007 Pattern: ring buffer with overwrite (drop oldest)
+    Authority: Hohpe & Woolf, Enterprise Integration Patterns, Addison-Wesley,
+    2003, "Publish-Subscribe Channel" Math: ALG-QUEUE-002 CircularBuffer
+    (Overwrite policy), one per subscriber, under the subscriber's mutex Tags:
+    pubsub, options, drop, ring-buffer, backpressure
+
+func WithOnSubscribers[M any](f func(topic string, subscribers int)) Option[M]
+    WithOnSubscribers calls f(topic, n) each time the number of subscribers
+    of topic changes: after a Subscribe has registered (it then receives
+    every message published from that point) and after one has left. It is the
+    observability hook (metrics, or a test waiting until a subscriber is ready).
+    f runs while the Bus holds its lock, so calls are in the order of the
+    changes; f must not call the Bus and must not block. A panic in f is
+    returned by that Subscribe as panics.ErrPanic. nil f is no hook (the
+    default).
+
+    ID: TB-PUBSUB-008 Pattern: observer hook Authority: Gamma, Helm, Johnson,
+    Vlissides, Design Patterns, Addison-Wesley, 1994, "Observer" Tags: pubsub,
+    options, hook, observability
+
+type Publisher[M any] interface {
+	Publish(ctx context.Context, topic string, msgs ...M) error
+}
+    Publisher publishes messages on a topic. It is the one method a message
+    producer needs; the in-process Bus implements it, and so do the broker
+    adapters (adapters/redis, adapters/kafka, adapters/rabbitmq) and the
+    packages built on them. Publish returns nil once every message has been
+    handed to the channel (for the Bus: to every subscriber registered on topic,
+    in order); an error means some messages may not have been. Publish must be
+    safe for concurrent use and must return promptly when ctx is done.
+
+    ID: TB-PUBSUB-001 Pattern: publish-subscribe channel (publisher side)
+    Authority: Hohpe & Woolf, Enterprise Integration Patterns, Addison-Wesley,
+    2003, "Publish-Subscribe Channel" Tags: pubsub, messaging, interface,
+    publish
+
+type Subscriber[M any] interface {
+	Subscribe(ctx context.Context, topic string, h func(context.Context, M) error) error
+}
+    Subscriber calls h for each message on topic, one at a time, in the
+    channel's order, until ctx is done, the channel closes or h returns an
+    error. It blocks for the whole subscription and returns the reason it ended,
+    never nil: context.Cause(ctx), ErrClosed, or h's error (a panic in h as
+    panics.ErrPanic), always after h has returned. Unsubscribing is cancelling
+    ctx. The in-process Bus implements it, and so do the broker adapters.
+    What happens to a message whose h failed (lost, redelivered, dead-lettered)
+    is the implementation's documented choice; for the Bus it is lost
+    (at-most-once).
+
+    ID: TB-PUBSUB-002 Pattern: event-driven consumer (on a publish-subscribe
+    channel) Authority: Hohpe & Woolf, Enterprise Integration Patterns,
+    Addison-Wesley, 2003, "Event-Driven Consumer" Authority: Hohpe & Woolf,
+    Enterprise Integration Patterns, Addison-Wesley, 2003, "Publish-Subscribe
+    Channel" Tags: pubsub, messaging, interface, subscribe, consumer
+
+=== package ctxkey
+package ctxkey // import "github.com/CrimsonCoder42/toolbench/ctxkey"
+
+Package ctxkey gives context values a typed key that cannot collide with another
+package's key: one package-level variable replaces the unexported key type,
+the two accessor functions and the type assertion that the context documentation
+asks every user of context.WithValue to write.
+
+ID short form: CTXKEY (IDs are TB-CTXKEY-NNN).
+
+Exports:
+
+    TB-CTXKEY-001  Key  a typed context key: With stores a T, Value reads it back as (T, bool)
+    TB-CTXKEY-002  New  returns a new, distinct key with a name used only for printing
+
+TYPES
+
+type Key[T any] struct {
+	// Has unexported fields.
+}
+    Key is a typed key for a request-scoped value of type T carried in a
+    context.Context.
+
+    The key's identity is its pointer: two keys made by two New calls are
+    distinct even when their names and types are equal, so a value stored under
+    one is never seen through the other, and no key can ever equal a string
+    or any other built-in key another package uses. Key has a string field,
+    so it is never zero-size and two keys never share an address. A Key is
+    immutable and safe for concurrent use. Create it with New and keep it in a
+    package-level variable; the zero value used through a pointer is a valid key
+    with the empty name, and copying a Key makes a different key.
+
+    ID: TB-CTXKEY-001 Pattern: typed context key (type-safe accessors for
+    request-scoped values) Authority: pkg.go.dev, package context, "func
+    WithValue" and "type Context" (method Value), go1.27 Authority: Ajmani,
+    "Go Concurrency Patterns: Context", The Go Blog, 2014, "Example: Google Web
+    Search" Tags: context, request-scoped, type-safe, key
+
+func New[T any](name string) *Key[T]
+    New returns a new key for values of type T. The name is shown when the key
+    or a context holding it is printed and is never part of the key's identity:
+    New[int]("user") twice gives two distinct keys. Callers namespace the name
+    ("auth.user-id") so printed contexts stay readable.
+
+    ID: TB-CTXKEY-002 Pattern: typed context key (type-safe accessors for
+    request-scoped values) Authority: pkg.go.dev, package context, "func
+    WithValue" and "type Context" (method Value), go1.27 Authority: Ajmani,
+    "Go Concurrency Patterns: Context", The Go Blog, 2014, "Example: Google Web
+    Search" Tags: context, request-scoped, type-safe, key, constructor
+
+func (k *Key[T]) String() string
+    String returns the key's name, so fmt.Sprint of a context shows it, as in
+    "context.Background.WithValue(user-id, int)". A nil k prints "<nil>".
+
+func (k *Key[T]) Value(ctx context.Context) (T, bool)
+    Value returns the value k holds in ctx (the nearest one, walking from ctx to
+    its root) and true, or the zero value of T and false when k holds nothing
+    there. A stored nil (for example a nil error) reads back as (nil, true).
+    A nil ctx or a nil k gives (zero, false). Value never blocks.
+
+func (k *Key[T]) With(ctx context.Context, v T) context.Context
+    With returns a child of ctx in which k holds v; ctx itself is not changed.
+    A later With on the same key in a descendant context shadows v for that
+    descendant only. A nil ctx is treated as context.Background() (the standard
+    library panics there; a toolbench function never panics on input). On a nil
+    k, With stores nothing and returns ctx unchanged. With starts no goroutine
+    and never blocks; cancellation is ctx's.
+
+=== package group
+package group // import "github.com/CrimsonCoder42/toolbench/group"
+
+Package group runs a set of functions on their own goroutines and waits for
+all of them: the error group (golang.org/x/sync/errgroup's shape: Go, TryGo,
+SetLimit, Wait, WithContext) and the result group (typed results in submission
+order). The first error wins and cancels the derived context; Wait returns only
+after every started goroutine has returned. A panic in a function is recovered
+and returned through Wait as panics.ErrPanic with its stack, never re-raised
+and never a crash. Nothing here panics or deadlocks on input: SetLimit while
+goroutines are active applies to later calls, and a limit of zero is reported as
+ErrZeroLimit.
+
+ID short form: GROUP (IDs are TB-GROUP-NNN).
+
+Exports:
+
+    TB-GROUP-001  Group         an error group: first error wins and cancels, optional limit, panics become ErrPanic
+    TB-GROUP-002  WithContext   a new Group and a ctx cancelled on its first error or when Wait returns
+    TB-GROUP-003  Results       a result group: one value per Go, returned by Wait in submission order
+    TB-GROUP-004  NewResults    a Results bound to a ctx, with options
+    TB-GROUP-005  Option        a functional option for NewResults
+    TB-GROUP-006  WithLimit     the most goroutines a Results runs at once (default no limit)
+    TB-GROUP-007  ErrZeroLimit  the error recorded when Go is called while the limit is zero
+
+VARIABLES
+
+var ErrZeroLimit = errors.New("group: limit is zero: no goroutine can be started")
+    ErrZeroLimit is recorded as the group's error when Go is called, or is
+    waiting for a slot, while the limit is zero. errgroup's Go blocks forever
+    in that case; here fn is not started, Go returns at once and Wait reports
+    ErrZeroLimit (first error wins, so an earlier error is kept).
+
+    ID: TB-GROUP-007 Pattern: error group (sentinel error) Authority: pkg.go.dev
+    golang.org/x/sync/errgroup v0.25.0, "func (*Group) SetLimit" Tags:
+    concurrency, errgroup, limit, sentinel
+
+
+TYPES
+
+type Group struct {
+	// Has unexported fields.
+}
+    Group runs functions on their own goroutines and waits for them; the first
+    non-nil error is kept and, for a Group made by WithContext, cancels its
+    context. It mirrors golang.org/x/sync/errgroup.Group, except that a panic
+    in a function is recovered and returned by Wait as *panics.PanicError
+    (errors.Is(err, panics.ErrPanic)), SetLimit never panics, and Go with
+    a limit of zero records ErrZeroLimit instead of blocking forever.
+    runtime.Goexit in a function is not an error: its goroutine ends and Wait
+    does not hang. The zero value is ready to use: no limit, no cancel on error.
+    A Group must not be copied after first use and is meant for one task.
+
+    ID: TB-GROUP-001 Pattern: error group (fork-join, first error
+    cancels) Authority: pkg.go.dev golang.org/x/sync/errgroup v0.25.0,
+    "type Group" Authority: Cox-Buday, Concurrency in Go, O'Reilly, 2017,
+    ch.4 "Error Handling" Goroutines: one per started Go or TryGo; each ends
+    when its function returns; all have exited when Wait returns Cancel:
+    WithContext's ctx is cancelled with the first error as its cause, or when
+    Wait returns Errors: the first of: a function's error, a recovered panic
+    (panics.ErrPanic), ErrZeroLimit Blocking: Go blocks while the active count
+    is at the limit; TryGo never blocks; Wait blocks until all return Tags:
+    concurrency, errgroup, cancel, limit, panic
+
+func WithContext(ctx context.Context) (*Group, context.Context)
+    WithContext returns a new Group and a context derived from ctx. The derived
+    context is cancelled the first time a function passed to Go returns a
+    non-nil error (or panics), with that error as its cause (context.Cause),
+    or the first time Wait returns, whichever comes first. A nil ctx is
+    context.Background().
+
+    ID: TB-GROUP-002 Pattern: error group (fork-join, first error cancels)
+    Authority: pkg.go.dev golang.org/x/sync/errgroup v0.25.0, "func WithContext"
+    Goroutines: none Cancel: the returned ctx is done when ctx is, on the
+    group's first error, or when Wait returns Tags: concurrency, errgroup,
+    context, cancel
+
+func (g *Group) Go(fn func() error)
+    Go calls fn on a new goroutine. It blocks until the goroutine can start
+    without the number of active goroutines exceeding the limit. If the limit is
+    zero, fn is not started and ErrZeroLimit is recorded. The first fn to return
+    a non-nil error or to panic sets the error Wait returns and cancels the
+    Group's context. As with errgroup, the first call to Go must happen before
+    Wait; fn may call Go on its own Group. A nil fn is a panic of the call and
+    is returned as panics.ErrPanic.
+
+func (g *Group) SetLimit(n int)
+    SetLimit limits the number of active goroutines to n. A negative n means
+    no limit; zero means no goroutine can start (Go records ErrZeroLimit,
+    TryGo returns false). Unlike errgroup it may be called while goroutines are
+    active: running goroutines are not stopped, and the new limit applies to
+    every later Go and TryGo, including a Go that is already waiting for a slot.
+
+func (g *Group) TryGo(fn func() error) bool
+    TryGo calls fn on a new goroutine only if the number of active goroutines
+    is below the limit, and reports whether it started. With a limit of zero it
+    returns false and records nothing (errgroup's rule).
+
+func (g *Group) Wait() error
+    Wait blocks until every function started by Go and TryGo has returned,
+    then cancels the Group's context and returns the first error, or nil.
+
+type Option func(*config)
+    Option changes how NewResults builds a Results. A nil Option is ignored.
+
+    ID: TB-GROUP-005 Pattern: functional options Authority: pkg.go.dev
+    golang.org/x/sync/errgroup v0.25.0, "func (*Group) SetLimit" Tags:
+    concurrency, options
+
+func WithLimit(n int) Option
+    WithLimit sets the most goroutines a Results runs at once, as Group.SetLimit
+    before the first Go. A negative n (the default, -1) means no limit; zero
+    means no goroutine can start and every Go records ErrZeroLimit.
+
+    ID: TB-GROUP-006 Pattern: bounded parallelism (limit option) Authority:
+    pkg.go.dev golang.org/x/sync/errgroup v0.25.0, "func (*Group) SetLimit"
+    Tags: concurrency, limit, options
+
+type Results[T any] struct {
+	// Has unexported fields.
+}
+    Results runs functions that each produce one value on their own goroutines
+    and returns the values in the order Go was called. It is a Group underneath:
+    the first error (or recovered panic, panics.ErrPanic) wins and cancels
+    the context passed to every function, and Wait returns only after every
+    goroutine has returned. A function whose goroutine starts after the
+    context is done is not called; context.Cause(ctx) is recorded instead,
+    so a cancelled run is never reported as a success. The zero value is ready
+    to use, with context.Background() and no limit; NewResults passes a context
+    and options. A Results must not be copied after first use and is meant for
+    one task.
+
+    ID: TB-GROUP-003 Pattern: result group (fork-join with ordered results)
+    Authority: pkg.go.dev golang.org/x/sync/errgroup v0.25.0, "type Group",
+    "func WithContext" Authority: Cox-Buday, Concurrency in Go, O'Reilly, 2017,
+    ch.4 "Error Handling" Goroutines: one per Go (at most the limit at once);
+    all have exited when Wait returns Cancel: the ctx given to each function
+    is cancelled on the first error, when the parent is, or when Wait returns
+    Errors: the first of: a function's error, panics.ErrPanic, ErrZeroLimit, the
+    context's cause Blocking: Go blocks while the active count is at the limit;
+    Wait blocks until all return Tags: concurrency, errgroup, results, ordered,
+    generic
+
+func NewResults[T any](ctx context.Context, opts ...Option) *Results[T]
+    NewResults returns a Results whose functions receive a context derived from
+    ctx (a nil ctx is context.Background()), configured by opts. The default is
+    no limit.
+
+    ID: TB-GROUP-004 Pattern: result group (fork-join with ordered results)
+    Authority: pkg.go.dev golang.org/x/sync/errgroup v0.25.0, "func
+    WithContext", "func (*Group) SetLimit" Goroutines: none Cancel: the derived
+    ctx is done when ctx is, on the first error, or when Wait returns Tags:
+    concurrency, errgroup, results, generic
+
+func (r *Results[T]) Go(fn func(ctx context.Context) (T, error))
+    Go reserves the next result slot and calls fn on a new goroutine with the
+    Results' context. It blocks while the active count is at the limit. fn's
+    value is kept only if fn returns a nil error. If the context is done when
+    the goroutine starts, fn is not called and the context's cause is recorded.
+    A nil fn is returned as panics.ErrPanic. As with Group, the first call to Go
+    must happen before Wait.
+
+func (r *Results[T]) Wait() ([]T, error)
+    Wait blocks until every function has returned and cancels the context.
+    With no error it returns one value per Go, in the order Go was called (nil
+    if Go was never called); otherwise it returns nil and the first error.
+

@@ -1,0 +1,22 @@
+# TODO
+
+- [x] 2026-11-13 Foundation + pattern ladder (doc/requests/foundation_2026-11-13.md)
+- [x] 2026-11-13 Devin: decisions 1-14 in doc/ladder_2026-11-13/LADDER.md §9 (D-006)
+- [x] 2026-11-13 calcbench R-1..R-3 shipped in calcbench v0.2.0 (D-033)
+- [x] 2026-11-13 calcbench R-4, R-5 shipped in calcbench v0.3.0 (D-034)
+- [x] 2026-11-13 Wave 1: panics, clock, ctxkey
+- [x] 2026-11-13 Wave 2: group, flow, semaphore, guard
+- [x] 2026-11-13 compare/: `go -C compare mod tidy` (authorised by Devin once) and `go test -race -timeout 10m ./...`: 5 ok
+- [x] 2026-11-13 Wave 3: recycle, pool, parallel, batch
+- [x] 2026-11-13 Wave 4: schedule (Cron pending), lifecycle, pubsub
+- [x] 2026-11-13 schedule.ParseCron (TB-SCHED-012)
+- [x] 2026-11-13 Wave 5: retry, singleflight, ratelimit, breaker
+- [x] 2026-11-13 Wave 6: bulkhead, cache, config, logging; ratelimit onto calcbench v0.3.0
+- [ ] Devin: semaphore AcquireNotify seam for bulkhead (D-036)
+- [ ] Wave 7: lock, txn, page, store
+- [ ] 2026-11-13 go-check hook (.claude/hooks/go-check.sh) and its settings.json entry
+- [ ] 2026-11-13 git init and first commit (Devin authorises)
+- [x] 2026-11-13 Align run: MATRIX.md + D1-D6 and the matrix additions (doc/align_2026-11-13/)
+- [ ] Devin: confirm D-045 (.env loader not built), D-046 (no struct binding), D-047 Component fields, D-049 header names; calcbench R-6..R-9 (doc/align_2026-11-13/calcbench_requests.md)
+- [ ] Hardening run: logging.Context per-record handler (10 allocs/op), group freed-broadcast herd (baseline recorded), flow Priority/Weighted benchmarks, logging DefaultPatterns, recycle typed-nil Put, batch.Channel buf preallocation, clock spec notes (DEFERRED.md, MATRIX.md §3 ranks 10-12, §5)
+- [ ] Devin: file two Go issues for the go1.27.3 internal compiler errors (ASSUMPTIONS, pool)
